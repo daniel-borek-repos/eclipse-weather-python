@@ -20,13 +20,19 @@ from flask import (
     request,
     url_for,
 )
+from flask_wtf.csrf import CSRFError, CSRFProtect
 
 import providers
 import services
 import settings as settings_store
 
 app = Flask(__name__)
+app.secret_key = settings_store.secret_key()
 app.config["JSON_SORT_KEYS"] = False
+# The dashboard is meant to be left open; expiring the token after the default
+# hour would turn an idle tab into a confusing failure on the next edit.
+app.config["WTF_CSRF_TIME_LIMIT"] = None
+csrf = CSRFProtect(app)
 
 
 # --------------------------------------------------------------------------
@@ -136,6 +142,13 @@ def show_view(view_id):
 def not_found(_error):
     return render_template("error.html", code=404,
                            message="That page does not exist."), 404
+
+
+@app.errorhandler(CSRFError)
+def csrf_failed(_reason):
+    # Every caller of the write APIs is the page's own JavaScript, so answer in
+    # the JSON shape it expects rather than Flask-WTF's HTML error page.
+    return _error("Security check failed. Reload the page and try again.", 400)
 
 
 # --------------------------------------------------------------------------

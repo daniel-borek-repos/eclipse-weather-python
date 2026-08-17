@@ -38,12 +38,26 @@ const App = (function () {
       .replace(/'/g, "&#39;");
   }
 
+  /* Methods the server treats as read-only, and so does not CSRF-check. */
+  const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+  /** The per-session CSRF token the server rendered into the page. */
+  function csrfToken() {
+    const meta = document.querySelector('meta[name="csrf-token"]');
+    return meta ? meta.getAttribute("content") : "";
+  }
+
   /** Fetch JSON and raise on transport or application-level failure. */
   async function api(path, options) {
     const settings = Object.assign({ headers: {} }, options || {});
     if (settings.body && typeof settings.body !== "string") {
       settings.body = JSON.stringify(settings.body);
       settings.headers["Content-Type"] = "application/json";
+    }
+
+    const method = (settings.method || "GET").toUpperCase();
+    if (!SAFE_METHODS.has(method)) {
+      settings.headers["X-CSRFToken"] = csrfToken();
     }
 
     let response;

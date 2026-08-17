@@ -12,6 +12,7 @@ ones that would catch a regression in the maths.
 import datetime as dt
 import json
 import os
+import re
 import tempfile
 import unittest
 
@@ -457,6 +458,19 @@ class TestRoutes(SettingsTestCase):
         settings_store.save(data)
         return view["id"]
 
+    def csrf_headers(self):
+        """A real CSRF token, lifted from a rendered page.
+
+        The tests send the genuine article rather than switching the protection
+        off, so the wiring itself stays under test. The client keeps cookies
+        between requests, so the session started here carries into the caller's
+        request.
+        """
+        page = self.client.get("/setup")
+        match = re.search(rb'name="csrf-token" content="([^"]+)"', page.data)
+        self.assertIsNotNone(match, "no CSRF token in the rendered page")
+        return {"X-CSRFToken": match.group(1).decode()}
+
     def test_first_visit_redirects_to_setup(self):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 302)
@@ -474,6 +488,7 @@ class TestRoutes(SettingsTestCase):
                 },
                 "view_name": "Home",
             },
+            headers=self.csrf_headers(),
         )
         self.assertEqual(response.status_code, 200)
         view_id = response.get_json()["view_id"]
@@ -483,7 +498,9 @@ class TestRoutes(SettingsTestCase):
         self.assertEqual(data["default_view_id"], view_id)
 
     def test_setup_rejects_missing_location(self):
-        response = self.client.post("/api/setup", json={})
+        response = self.client.post(
+            "/api/setup", json={}, headers=self.csrf_headers()
+        )
         self.assertEqual(response.status_code, 400)
         self.assertFalse(response.get_json()["ok"])
 
@@ -551,6 +568,7 @@ class TestRoutes(SettingsTestCase):
                     "timezone": "Atlantic/Reykjavik",
                 }
             },
+            headers=self.csrf_headers(),
         )
         self.assertEqual(response.status_code, 200)
         location_id = response.get_json()["location"]["id"]
@@ -559,7 +577,8 @@ class TestRoutes(SettingsTestCase):
         self.assertEqual(len(settings_store.get_view(data, view_id)["locations"]), 2)
 
         response = self.client.delete(
-            "/api/views/%s/locations/%s" % (view_id, location_id)
+            "/api/views/%s/locations/%s" % (view_id, location_id),
+            headers=self.csrf_headers(),
         )
         self.assertEqual(response.status_code, 200)
         data = settings_store.load()
@@ -570,6 +589,7 @@ class TestRoutes(SettingsTestCase):
         response = self.client.post(
             "/api/views",
             json={"name": "Trip", "copy_locations_from": view_id, "make_default": True},
+            headers=self.csrf_headers(),
         )
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
@@ -581,26 +601,40 @@ class TestRoutes(SettingsTestCase):
 
     def test_rename_view(self):
         view_id = self.seed()
-        response = self.client.patch("/api/views/%s" % view_id, json={"name": "Kraków"})
+        response = self.client.patch(
+            "/api/views/%s" % view_id,
+            json={"name": "Kraków"},
+            headers=self.csrf_headers(),
+        )
         self.assertEqual(response.status_code, 200)
         data = settings_store.load()
         self.assertEqual(settings_store.get_view(data, view_id)["name"], "Kraków")
 
     def test_rename_to_blank_is_rejected(self):
         view_id = self.seed()
-        response = self.client.patch("/api/views/%s" % view_id, json={"name": "   "})
+        response = self.client.patch(
+            "/api/views/%s" % view_id,
+            json={"name": "   "},
+            headers=self.csrf_headers(),
+        )
         self.assertEqual(response.status_code, 400)
 
     def test_delete_last_view_is_rejected(self):
         view_id = self.seed()
-        response = self.client.delete("/api/views/%s" % view_id)
+        response = self.client.delete(
+            "/api/views/%s" % view_id, headers=self.csrf_headers()
+        )
         self.assertEqual(response.status_code, 400)
 
     def test_delete_view_redirects_to_survivor(self):
         first = self.seed()
-        second = self.client.post("/api/views", json={"name": "Trip"}).get_json()["view"]["id"]
+        second = self.client.post(
+            "/api/views", json={"name": "Trip"}, headers=self.csrf_headers()
+        ).get_json()["view"]["id"]
 
-        response = self.client.delete("/api/views/%s" % first)
+        response = self.client.delete(
+            "/api/views/%s" % first, headers=self.csrf_headers()
+        )
         self.assertEqual(response.status_code, 200)
         self.assertIn(second, response.get_json()["redirect"])
 
@@ -609,6 +643,7 @@ class TestRoutes(SettingsTestCase):
         response = self.client.patch(
             "/api/preferences",
             json={"temperature_unit": "fahrenheit", "time_format": "12h"},
+            headers=self.csrf_headers(),
         )
         self.assertEqual(response.status_code, 200)
         data = settings_store.load()
@@ -628,10 +663,26 @@ class TestRoutes(SettingsTestCase):
 
     def test_twelve_hour_preference_reaches_the_payload(self):
         view_id = self.seed()
-        self.client.patch("/api/preferences", json={"time_format": "12h"})
+        self.client.patch(
+            "/api/preferences",
+            json={"time_format": "12h"},
+            headers=self.csrf_headers(),
+        )
         response = self.client.get("/api/views/%s/weather" % view_id)
         maximum = response.get_json()["locations"][0]["eclipse"]["times"]["maximum"]
         self.assertRegex(maximum, r"(AM|PM)$")
+
+    def test_mutation_without_csrf_token_is_rejected(self):
+        self.seed()
+        response = self.client.post("/api/views", json={"name": "Trip"})
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(response.get_json()["ok"])
+
+    def test_reads_do_not_need_a_csrf_token(self):
+        view_id = self.seed()
+        self.assertEqual(
+            self.client.get("/api/views/%s/weather" % view_id).status_code, 200
+        )
 
 
 if __name__ == "__main__":

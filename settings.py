@@ -11,6 +11,7 @@ half-written file behind.
 
 import json
 import os
+import secrets
 import tempfile
 import threading
 import uuid
@@ -42,10 +43,35 @@ def settings_path():
     )
 
 
+def secret_key():
+    """Stable key for signing the session cookie that carries the CSRF token.
+
+    Generated on first use and stored alongside the other settings, so tokens
+    survive a restart instead of invalidating every open tab.
+    """
+    override = os.environ.get("ECLIPSE_WEATHER_SECRET_KEY")
+    if override:
+        return override
+
+    # _lock is reentrant, so the nested load/save below is fine.
+    with _lock:
+        data = load()
+        if not data.get("secret_key"):
+            data["secret_key"] = secrets.token_urlsafe(32)
+            save(data)
+        return data["secret_key"]
+
+
 def default_settings():
-    """A fresh, unconfigured settings document."""
+    """A fresh, unconfigured settings document.
+
+    ``secret_key`` stays ``None`` here on purpose: this function runs on every
+    ``load()`` via ``_migrate()``, so generating a key would mint a new one on
+    each read and silently throw it away. ``secret_key()`` fills it in once.
+    """
     return {
         "version": SCHEMA_VERSION,
+        "secret_key": None,
         "setup_complete": False,
         "default_view_id": None,
         "preferences": {
