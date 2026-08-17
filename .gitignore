@@ -1,0 +1,20 @@
+.claude/
+.vscode/
+
+# Personal settings: contains your home coordinates. Use the sample instead.
+settings.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS noise
+.DS_Store
+Thumbs.db
