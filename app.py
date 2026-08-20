@@ -98,7 +98,7 @@ def _mutate(handler):
 # --------------------------------------------------------------------------
 
 
-@app.route("/")
+@app.route("/", methods=["GET"])
 def index():
     data = settings_store.load()
     if not data["setup_complete"] or not data["views"]:
