@@ -111,9 +111,10 @@ python -m pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest -q
 ```
 
-56 tests, no network required — the weather provider is stubbed. The astronomy
+91 tests, no network required — the weather provider is stubbed. The astronomy
 tests assert against real published eclipse circumstances, so they are the ones
-that would catch a regression in the maths.
+that would catch a regression in the maths. The provider tests swap out
+`providers.requests` wholesale, so no HTTP call is ever made.
 
 To produce the coverage and test-execution reports that SonarQube reads:
 

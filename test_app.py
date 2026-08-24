@@ -16,6 +16,8 @@ import re
 import tempfile
 import unittest
 
+import requests
+
 import astro
 import providers
 import services
@@ -683,6 +685,342 @@ class TestRoutes(SettingsTestCase):
         self.assertEqual(
             self.client.get("/api/views/%s/weather" % view_id).status_code, 200
         )
+
+
+# --------------------------------------------------------------------------
+# Providers (the HTTP layer)
+# --------------------------------------------------------------------------
+
+
+class FakeResponse(object):
+    """Stand-in for a requests.Response, with only what _get_json touches."""
+
+    def __init__(self, payload=None, status_code=200, malformed=False):
+        self.payload = payload
+        self.status_code = status_code
+        self.malformed = malformed
+
+    def json(self):
+        if self.malformed:
+            raise ValueError("not JSON")
+        return self.payload
+
+
+class FakeRequests(object):
+    """Replaces providers.requests, so the real module is left alone.
+
+    The exception classes are the real ones, because that is what the
+    ``except`` clauses in providers are matching against.
+    """
+
+    exceptions = requests.exceptions
+
+    def __init__(self, get):
+        self.get = get
+
+
+class ProviderTestCase(unittest.TestCase):
+    """Swaps out the HTTP layer and records every call made through it."""
+
+    def setUp(self):
+        providers.clear_caches()
+        self._real_requests = providers.requests
+        self.calls = []
+
+    def tearDown(self):
+        providers.requests = self._real_requests
+        providers.clear_caches()
+
+    def serve(self, *responses):
+        """Answer successive calls with the given responses.
+
+        A FakeResponse is returned, an exception instance is raised. The
+        last entry is reused once the earlier ones are spent, which keeps
+        the "call it twice and check the cache" tests readable.
+        """
+        queue = list(responses)
+
+        def fake_get(url, params=None, timeout=None, headers=None):
+            self.calls.append(
+                {"url": url, "params": params, "timeout": timeout, "headers": headers}
+            )
+            item = queue.pop(0) if len(queue) > 1 else queue[0]
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        providers.requests = FakeRequests(fake_get)
+
+
+class TestTimedCache(ProviderTestCase):
+    def test_returns_what_was_stored(self):
+        cache = providers._TimedCache(60)
+        cache.set("k", {"v": 1})
+        self.assertEqual(cache.get("k"), {"v": 1})
+
+    def test_unknown_key_is_none(self):
+        self.assertIsNone(providers._TimedCache(60).get("nope"))
+
+    def test_entry_past_its_ttl_is_dropped(self):
+        # A negative TTL expires immediately, so the test needs no sleep.
+        cache = providers._TimedCache(-1)
+        cache.set("k", "v")
+        self.assertIsNone(cache.get("k"))
+        self.assertEqual(cache._entries, {})
+
+    def test_clear_empties_the_cache(self):
+        cache = providers._TimedCache(60)
+        cache.set("k", "v")
+        cache.clear()
+        self.assertIsNone(cache.get("k"))
+
+    def test_clear_caches_clears_both_module_caches(self):
+        providers._weather_cache.set("w", 1)
+        providers._geocode_cache.set("g", 2)
+        providers.clear_caches()
+        self.assertIsNone(providers._weather_cache.get("w"))
+        self.assertIsNone(providers._geocode_cache.get("g"))
+
+
+class TestGetJson(ProviderTestCase):
+    def test_returns_the_decoded_body(self):
+        self.serve(FakeResponse({"hello": "world"}))
+        self.assertEqual(providers._get_json("http://x"), {"hello": "world"})
+
+    def test_sends_a_timeout_and_identifies_itself(self):
+        self.serve(FakeResponse({}))
+        providers._get_json("http://x", {"a": 1})
+        call = self.calls[0]
+        self.assertEqual(call["timeout"], providers.REQUEST_TIMEOUT)
+        self.assertEqual(call["params"], {"a": 1})
+        self.assertEqual(call["headers"]["User-Agent"], providers.USER_AGENT)
+
+    def test_timeout_becomes_a_provider_error(self):
+        self.serve(requests.exceptions.Timeout())
+        with self.assertRaises(providers.ProviderError) as caught:
+            providers._get_json("http://x")
+        self.assertIn("did not respond in time", str(caught.exception))
+
+    def test_connection_failure_becomes_a_provider_error(self):
+        self.serve(requests.exceptions.ConnectionError())
+        with self.assertRaises(providers.ProviderError) as caught:
+            providers._get_json("http://x")
+        self.assertIn("Could not reach", str(caught.exception))
+
+    def test_error_status_is_reported_with_its_code(self):
+        self.serve(FakeResponse(status_code=503))
+        with self.assertRaises(providers.ProviderError) as caught:
+            providers._get_json("http://x")
+        self.assertIn("503", str(caught.exception))
+
+    def test_unparseable_body_becomes_a_provider_error(self):
+        self.serve(FakeResponse(malformed=True))
+        with self.assertRaises(providers.ProviderError) as caught:
+            providers._get_json("http://x")
+        self.assertIn("malformed", str(caught.exception))
+
+
+class TestFetchWeather(ProviderTestCase):
+    def test_returns_the_forecast(self):
+        self.serve(FakeResponse(FAKE_FORECAST))
+        self.assertEqual(providers.fetch_weather(50.0, 19.9), FAKE_FORECAST)
+        self.assertEqual(self.calls[0]["url"], providers.FORECAST_URL)
+
+    def test_repeated_calls_are_served_from_the_cache(self):
+        self.serve(FakeResponse(FAKE_FORECAST))
+        providers.fetch_weather(50.0, 19.9)
+        providers.fetch_weather(50.0, 19.9)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_different_units_are_fetched_separately(self):
+        self.serve(FakeResponse(FAKE_FORECAST))
+        providers.fetch_weather(50.0, 19.9, temperature_unit="celsius")
+        providers.fetch_weather(50.0, 19.9, temperature_unit="fahrenheit")
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(self.calls[1]["params"]["temperature_unit"], "fahrenheit")
+
+    def test_units_reach_the_request(self):
+        self.serve(FakeResponse(FAKE_FORECAST))
+        providers.fetch_weather(50.0, 19.9, wind_speed_unit="mph", forecast_days=2)
+        params = self.calls[0]["params"]
+        self.assertEqual(params["wind_speed_unit"], "mph")
+        self.assertEqual(params["forecast_days"], 2)
+
+    def test_a_response_without_current_conditions_is_an_error(self):
+        self.serve(FakeResponse({"daily": {}}))
+        with self.assertRaises(providers.ProviderError) as caught:
+            providers.fetch_weather(50.0, 19.9)
+        self.assertIn("current conditions", str(caught.exception))
+
+    def test_a_failed_fetch_is_not_cached(self):
+        self.serve(FakeResponse({"daily": {}}), FakeResponse(FAKE_FORECAST))
+        with self.assertRaises(providers.ProviderError):
+            providers.fetch_weather(50.0, 19.9)
+        self.assertEqual(providers.fetch_weather(50.0, 19.9), FAKE_FORECAST)
+
+
+class TestSearchPlaces(ProviderTestCase):
+    RESULT = {
+        "name": "Kraków",
+        "country": "Poland",
+        "country_code": "PL",
+        "admin1": "Lesser Poland",
+        "latitude": 50.06143,
+        "longitude": 19.93658,
+        "timezone": "Europe/Warsaw",
+        "elevation": 219.0,
+        "population": 755050,
+    }
+
+    def test_a_short_query_never_hits_the_network(self):
+        self.serve(FakeResponse({"results": [self.RESULT]}))
+        self.assertEqual(providers.search_places("a"), [])
+        self.assertEqual(providers.search_places("  "), [])
+        self.assertEqual(providers.search_places(None), [])
+        self.assertEqual(self.calls, [])
+
+    def test_maps_the_fields_it_cares_about(self):
+        self.serve(FakeResponse({"results": [self.RESULT]}))
+        found = providers.search_places("Krakow")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["name"], "Kraków")
+        self.assertEqual(found[0]["country_code"], "PL")
+        self.assertEqual(found[0]["latitude"], 50.06143)
+        self.assertEqual(found[0]["population"], 755050)
+
+    def test_results_without_coordinates_are_skipped(self):
+        self.serve(
+            FakeResponse(
+                {
+                    "results": [
+                        {"name": "No latitude", "longitude": 1.0},
+                        {"name": "No longitude", "latitude": 1.0},
+                        self.RESULT,
+                    ]
+                }
+            )
+        )
+        found = providers.search_places("Krakow")
+        self.assertEqual([item["name"] for item in found], ["Kraków"])
+
+    def test_a_response_without_results_gives_an_empty_list(self):
+        self.serve(FakeResponse({}))
+        self.assertEqual(providers.search_places("Nowhere"), [])
+
+    def test_repeated_queries_are_served_from_the_cache(self):
+        self.serve(FakeResponse({"results": [self.RESULT]}))
+        providers.search_places("Krakow")
+        providers.search_places("KRAKOW")  # the cache key is lowercased
+        self.assertEqual(len(self.calls), 1)
+
+
+class TestReverseGeocode(ProviderTestCase):
+    def test_uses_bigdatacloud_when_it_answers(self):
+        self.serve(
+            FakeResponse(
+                {
+                    "city": "Kraków",
+                    "countryName": "Poland",
+                    "countryCode": "PL",
+                    "principalSubdivision": "Lesser Poland",
+                }
+            )
+        )
+        place = providers.reverse_geocode(50.06143, 19.93658)
+        self.assertEqual(place["name"], "Kraków")
+        self.assertEqual(place["country"], "Poland")
+        self.assertEqual(self.calls[0]["url"], providers.REVERSE_GEOCODE_URL)
+
+    def test_falls_back_to_the_locality_then_the_subdivision(self):
+        self.serve(FakeResponse({"locality": "Kazimierz"}))
+        self.assertEqual(providers.reverse_geocode(50.0, 19.9)["name"], "Kazimierz")
+        providers.clear_caches()
+        self.serve(FakeResponse({"principalSubdivision": "Lesser Poland"}))
+        self.assertEqual(providers.reverse_geocode(50.0, 19.9)["name"], "Lesser Poland")
+
+    def test_falls_back_to_open_meteo_when_bigdatacloud_fails(self):
+        self.serve(
+            FakeResponse(status_code=500),
+            FakeResponse({"timezone": "Europe/Warsaw"}),
+        )
+        place = providers.reverse_geocode(50.0, 19.9)
+        self.assertEqual(place["name"], "Warsaw")
+        self.assertEqual(self.calls[1]["url"], providers.FORECAST_URL)
+
+    def test_falls_back_to_open_meteo_when_bigdatacloud_has_no_name(self):
+        self.serve(
+            FakeResponse({"countryName": "Poland"}),
+            FakeResponse({"timezone": "America/New_York"}),
+        )
+        # Underscores in the zone name are spaces in the label.
+        self.assertEqual(providers.reverse_geocode(40.7, -74.0)["name"], "New York")
+
+    def test_falls_back_to_coordinates_when_everything_fails(self):
+        self.serve(FakeResponse(status_code=500))
+        place = providers.reverse_geocode(50.06143, 19.93658)
+        self.assertEqual(place["name"], "50.061, 19.937")
+        self.assertIsNone(place["country"])
+
+    def test_falls_back_to_coordinates_when_open_meteo_has_no_timezone(self):
+        self.serve(FakeResponse(status_code=500), FakeResponse({}))
+        self.assertEqual(providers.reverse_geocode(1.0, 2.0)["name"], "1.000, 2.000")
+
+    def test_the_coordinates_are_echoed_back_rounded(self):
+        self.serve(FakeResponse({"city": "Kraków"}))
+        place = providers.reverse_geocode(50.061431111, 19.936581111)
+        self.assertEqual(place["latitude"], 50.06143)
+        self.assertEqual(place["longitude"], 19.93658)
+
+    def test_nearby_coordinates_share_a_cache_entry(self):
+        self.serve(FakeResponse({"city": "Kraków"}))
+        providers.reverse_geocode(50.0614, 19.9366)
+        providers.reverse_geocode(50.06141, 19.93661)  # same to 3 decimals
+        self.assertEqual(len(self.calls), 1)
+
+
+class TestLocateByIp(ProviderTestCase):
+    def test_returns_the_detected_location(self):
+        self.serve(
+            FakeResponse(
+                {
+                    "city": "Kraków",
+                    "region": "Lesser Poland",
+                    "country_name": "Poland",
+                    "country_code": "PL",
+                    "latitude": 50.0614,
+                    "longitude": 19.9366,
+                    "timezone": "Europe/Warsaw",
+                }
+            )
+        )
+        place = providers.locate_by_ip()
+        self.assertEqual(place["name"], "Kraków")
+        self.assertEqual(place["latitude"], 50.0614)
+        self.assertEqual(place["source"], "ip")
+        self.assertEqual(self.calls[0]["url"], providers.IP_LOOKUP_URL)
+
+    def test_falls_back_to_the_region_then_a_generic_label(self):
+        self.serve(FakeResponse({"region": "Lesser Poland", "latitude": 1, "longitude": 2}))
+        self.assertEqual(providers.locate_by_ip()["name"], "Lesser Poland")
+        self.serve(FakeResponse({"latitude": 1, "longitude": 2}))
+        self.assertEqual(providers.locate_by_ip()["name"], "Detected location")
+
+    def test_an_unreachable_service_is_reported(self):
+        self.serve(requests.exceptions.Timeout())
+        with self.assertRaises(providers.ProviderError) as caught:
+            providers.locate_by_ip()
+        self.assertIn("your network", str(caught.exception))
+
+    def test_an_error_payload_is_reported(self):
+        self.serve(FakeResponse({"error": True, "reason": "quota"}))
+        with self.assertRaises(providers.ProviderError):
+            providers.locate_by_ip()
+
+    def test_a_payload_without_a_latitude_is_reported(self):
+        self.serve(FakeResponse({"city": "Nowhere"}))
+        with self.assertRaises(providers.ProviderError):
+            providers.locate_by_ip()
+
 
 
 if __name__ == "__main__":
