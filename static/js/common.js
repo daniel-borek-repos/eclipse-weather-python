@@ -1,6 +1,9 @@
 /* Shared helpers for the setup page and the dashboard. */
 
-const App = (function () {
+/* Assigned to window (rather than a bare const) so the module can also be
+   imported directly by the front-end tests. Browsers see no difference:
+   other scripts still reference it as a bare `App`. */
+window.App = (function () {
   "use strict";
 
   /* Weather icon names come from the server; map them to glyphs here so the

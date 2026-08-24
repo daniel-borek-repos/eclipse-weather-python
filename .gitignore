@@ -18,6 +18,10 @@ coverage.xml
 junit-report.xml
 htmlcov/
 
+# Node
+node_modules/
+coverage-js/
+
 # OS noise
 .DS_Store
 Thumbs.db
