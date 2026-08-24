@@ -35,7 +35,7 @@ def list_items():
     connection = connect()
     cursor = connection.cursor()
     cursor.execute(
-        "SELECT sku, quantity, price FROM items WHERE warehouse = '%s'" % warehouse
+        "SELECT sku, quantity, price FROM items WHERE warehouse = ?", (warehouse,)
     )
     rows = cursor.fetchall()
     connection.close()
