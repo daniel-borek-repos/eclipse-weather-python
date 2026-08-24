@@ -125,6 +125,19 @@ python -m pytest --cov --cov-report=xml --cov-report=term --junitxml=junit-repor
 That writes `coverage.xml` (Cobertura) and `junit-report.xml`. Both are build
 artifacts and are gitignored; CI regenerates them before every analysis.
 
+### Front-end tests
+
+The browser JavaScript is tested with Vitest under jsdom:
+
+```bash
+npm install
+npm test           # or: npm run coverage
+```
+
+`npm run coverage` writes `coverage-js/lcov.info`, which SonarQube reads via
+`sonar.javascript.lcov.reportPaths`. No lockfile is committed, so CI uses
+`npm install` rather than `npm ci`.
+
 ## Layout
 
 ```
