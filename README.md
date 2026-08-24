@@ -107,12 +107,22 @@ partial phases of a total eclipse.
 ## Tests
 
 ```bash
-python -m pytest test_app.py -q
+python -m pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest -q
 ```
 
-54 tests, no network required — the weather provider is stubbed. The astronomy
+56 tests, no network required — the weather provider is stubbed. The astronomy
 tests assert against real published eclipse circumstances, so they are the ones
 that would catch a regression in the maths.
+
+To produce the coverage and test-execution reports that SonarQube reads:
+
+```bash
+python -m pytest --cov --cov-report=xml --cov-report=term --junitxml=junit-report.xml
+```
+
+That writes `coverage.xml` (Cobertura) and `junit-report.xml`. Both are build
+artifacts and are gitignored; CI regenerates them before every analysis.
 
 ## Layout
 
