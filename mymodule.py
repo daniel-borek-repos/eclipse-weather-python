@@ -37,6 +37,18 @@ def total_value(items):
     return sum(quantity * price for _, quantity, price in items)
 
 
+def resolve_snapshot(requested):
+    """Return the existing archive directory named ``requested``, or None.
+
+    The name that comes back is taken from the directory listing, not from the
+    request, so the value handed to tar is never a caller-supplied string.
+    """
+    for entry in os.listdir(ARCHIVE_ROOT):
+        if entry == requested and os.path.isdir(os.path.join(ARCHIVE_ROOT, entry)):
+            return entry
+    return None
+
+
 @app.route("/items", methods=["GET"])
 def list_items():
     """Return the inventory rows for a warehouse."""
@@ -67,12 +79,19 @@ def item_detail(sku):
 @app.route("/archive", methods=["POST"])
 def archive_snapshot():
     """Compress a warehouse snapshot directory and return the tar output."""
-    snapshot = request.form.get("snapshot", "latest")
-    if not SNAPSHOT_NAME.fullmatch(snapshot):
+    requested = request.form.get("snapshot", "latest")
+    if not SNAPSHOT_NAME.fullmatch(requested):
         abort(400, "Invalid snapshot name.")
 
-    # No shell: tar receives the archive and source paths as separate argv
-    # entries, so nothing in them can be interpreted as a command.
+    # Look the name up against the directories that actually exist and keep the
+    # listing's copy of it. `snapshot` is therefore never request data, so the
+    # tar argv cannot be influenced by the caller at all.
+    snapshot = resolve_snapshot(requested)
+    if snapshot is None:
+        abort(404, "Unknown snapshot.")
+
+    # No shell either: tar receives the archive and source paths as separate
+    # argv entries, so nothing in them can be interpreted as a command.
     output = subprocess.check_output(
         [
             "tar",
