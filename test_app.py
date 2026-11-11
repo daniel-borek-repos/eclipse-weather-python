@@ -16,10 +16,13 @@ import re
 import tempfile
 import unittest
 
+import pytest
 import requests
 
 import astro
+import formats
 import providers
+import ratelimit
 import services
 import settings as settings_store
 
@@ -1021,6 +1024,245 @@ class TestLocateByIp(ProviderTestCase):
         with self.assertRaises(providers.ProviderError):
             providers.locate_by_ip()
 
+
+
+# --------------------------------------------------------------------------
+# Public location API
+# --------------------------------------------------------------------------
+
+
+class FakeClock(object):
+    """A monotonic clock that only moves when something sleeps on it."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.sleeps = []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+KRAKOW_PLACE = {
+    "name": "Kraków",
+    "country": "Poland",
+    "country_code": "PL",
+    "admin1": "Lesser Poland",
+    "latitude": 50.06143,
+    "longitude": 19.93658,
+    "timezone": "Europe/Warsaw",
+}
+LOCATION_URL = "/api/location"
+
+
+def test_rate_limiter_lets_first_call_through_immediately():
+    clock = FakeClock()
+    limiter = ratelimit.SlotRateLimiter(clock=clock, sleep=clock.sleep)
+    assert limiter.wait("a") == 0
+    assert clock.sleeps == []
+
+
+def test_rate_limiter_delays_burst_to_one_per_second():
+    clock = FakeClock()
+    limiter = ratelimit.SlotRateLimiter(clock=clock, sleep=clock.sleep)
+    limiter.wait("a")
+    clock.now += 0.25
+    limiter.wait("a")
+    assert clock.sleeps == [0.75]
+
+
+def test_rate_limiter_tracks_clients_separately():
+    clock = FakeClock()
+    limiter = ratelimit.SlotRateLimiter(clock=clock, sleep=clock.sleep)
+    limiter.wait("a")
+    assert limiter.wait("b") == 0
+
+
+def test_rate_limiter_defaults_to_at_most_three_queued_waiters():
+    # With a frozen clock, the first call proceeds and only three more can wait.
+    sleeps = []
+    limiter = ratelimit.SlotRateLimiter(
+        clock=lambda: 0.0, sleep=sleeps.append
+    )
+    for _ in range(4):
+        limiter.wait("a")
+    assert sleeps == [1.0, 2.0, 3.0]
+    try:
+        limiter.wait("a")
+    except ratelimit.RateLimitExceeded as error:
+        assert error.retry_after == 4.0
+    else:
+        raise AssertionError("expected RateLimitExceeded")
+
+
+def test_rate_limiter_refuses_when_queue_is_too_long():
+    # A frozen clock lets the reservations pile up without anyone sleeping.
+    limiter = ratelimit.SlotRateLimiter(
+        max_wait=2.0, clock=lambda: 0.0, sleep=lambda seconds: None
+    )
+    for _ in range(3):
+        limiter.wait("a")
+    try:
+        limiter.wait("a")
+    except ratelimit.RateLimitExceeded as error:
+        assert error.retry_after == 3.0
+    else:
+        raise AssertionError("expected RateLimitExceeded")
+
+
+def test_text_format_flattens_nested_payload():
+    text = formats.to_text(
+        {"name": "Kraków", "is_day": True, "wind_compass": None,
+         "today": {"forecast": [{"label": "Mon"}], "errors": {}}}
+    )
+    assert text == (
+        "name: Kraków\n"
+        "is day: true\n"
+        "wind compass: -\n"
+        "today:\n"
+        "  forecast:\n"
+        "    #1:\n"
+        "      label: Mon\n"
+        "  errors: -\n"
+    )
+
+
+def test_xml_format_is_well_formed():
+    from xml.etree import ElementTree
+
+    document = formats.to_xml({"ok": True, "items": [1, 2], "9bad key": "<&>"})
+    root = ElementTree.fromstring(document.split("?>", 1)[1])
+    assert root.tag == "response"
+    assert root.findtext("ok") == "true"
+    assert [item.text for item in root.find("items")] == ["1", "2"]
+    assert root.findtext("_9bad_key") == "<&>"
+
+
+@pytest.fixture
+def location_client(monkeypatch, tmp_path):
+    import app as app_module
+
+    monkeypatch.setenv("ECLIPSE_WEATHER_SETTINGS", str(tmp_path / "settings.json"))
+    monkeypatch.setattr(providers, "fetch_weather", lambda *a, **k: FAKE_FORECAST)
+    monkeypatch.setattr(
+        providers, "search_places", lambda query, **k: [KRAKOW_PLACE]
+    )
+    clock = FakeClock()
+    monkeypatch.setattr(
+        app_module,
+        "location_api_limiter",
+        ratelimit.SlotRateLimiter(clock=clock, sleep=clock.sleep),
+    )
+    app_module.app.config["TESTING"] = True
+    yield app_module.app.test_client(), clock
+    services._eclipse_cache.clear()
+
+
+def test_location_api_returns_json_by_default(location_client):
+    client, _ = location_client
+    response = client.get(LOCATION_URL, query_string={"city": "Krakow", "country": "Poland"})
+    assert response.status_code == 200
+    assert response.mimetype == "application/json"
+    location = response.get_json()["location"]
+    assert location["name"] == "Kraków"
+    assert "id" not in location
+    assert location["weather"]["temperature"] is not None
+    assert location["today"]["sunrise"]
+    assert location["eclipse"]["type"] in ("partial", "annular", "total")
+
+
+def test_location_api_accepts_country_code(location_client):
+    client, _ = location_client
+    response = client.get(LOCATION_URL, query_string={"city": "Krakow", "country": "pl"})
+    assert response.status_code == 200
+
+
+def test_location_api_text_format(location_client):
+    client, _ = location_client
+    response = client.get(
+        LOCATION_URL,
+        query_string={"city": "Krakow", "country": "Poland", "format": "text"},
+    )
+    assert response.status_code == 200
+    assert response.mimetype == "text/plain"
+    assert "name: Kraków" in response.get_data(as_text=True)
+
+
+def test_location_api_xml_format(location_client):
+    from xml.etree import ElementTree
+
+    client, _ = location_client
+    response = client.get(
+        LOCATION_URL,
+        query_string={"city": "Krakow", "country": "Poland", "format": "XML"},
+    )
+    assert response.status_code == 200
+    assert response.mimetype == "application/xml"
+    root = ElementTree.fromstring(response.data)
+    assert root.findtext("location/name") == "Kraków"
+
+
+def test_location_api_rejects_unknown_format(location_client):
+    client, _ = location_client
+    response = client.get(
+        LOCATION_URL,
+        query_string={"city": "Krakow", "country": "Poland", "format": "yaml"},
+    )
+    assert response.status_code == 400
+
+
+def test_location_api_requires_city_and_country(location_client):
+    client, _ = location_client
+    response = client.get(LOCATION_URL, query_string={"city": "Krakow"})
+    assert response.status_code == 400
+
+
+def test_location_api_reports_unknown_place(location_client):
+    client, _ = location_client
+    response = client.get(
+        LOCATION_URL,
+        query_string={"city": "Krakow", "country": "Peru", "format": "text"},
+    )
+    assert response.status_code == 404
+    assert "error:" in response.get_data(as_text=True)
+
+
+def test_location_api_reports_provider_failure(location_client, monkeypatch):
+    def broken(query, **kwargs):
+        raise providers.ProviderError("geocoder down")
+
+    monkeypatch.setattr(providers, "search_places", broken)
+    client, _ = location_client
+    response = client.get(LOCATION_URL, query_string={"city": "Krakow", "country": "Poland"})
+    assert response.status_code == 502
+
+
+def test_location_api_waits_between_rapid_calls(location_client):
+    client, clock = location_client
+    query = {"city": "Krakow", "country": "Poland"}
+    client.get(LOCATION_URL, query_string=query)
+    client.get(LOCATION_URL, query_string=query)
+    assert clock.sleeps == [1.0]
+
+
+def test_location_api_refuses_overlong_queue(location_client, monkeypatch):
+    import app as app_module
+
+    monkeypatch.setattr(
+        app_module,
+        "location_api_limiter",
+        ratelimit.SlotRateLimiter(max_wait=0.5, clock=lambda: 0.0,
+                                  sleep=lambda seconds: None),
+    )
+    client, _ = location_client
+    query = {"city": "Krakow", "country": "Poland"}
+    client.get(LOCATION_URL, query_string=query)
+    response = client.get(LOCATION_URL, query_string=query)
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "2"
 
 
 if __name__ == "__main__":

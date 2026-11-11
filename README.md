@@ -52,6 +52,76 @@ Set `ECLIPSE_WEATHER_SETTINGS=/some/path.json` to store settings elsewhere.
 
 The view marked *default* is the one that opens when you visit `/`.
 
+## Location API
+
+Everything a dashboard card shows for a place — current weather, today's
+sunrise, sunset and forecast, and the next visible solar eclipse — is also
+available from a single unauthenticated HTTP call, so you can script against
+the running server without opening the web UI:
+
+```
+GET /api/location?city=<city>&country=<country>&format=<json|text|xml>
+```
+
+| Parameter | Required | Meaning |
+| --- | --- | --- |
+| `city` | yes | Place name, as you would type it into **Add location** |
+| `country` | yes | Country name (`Poland`) or ISO code (`PL`), case-insensitive |
+| `format` | no | `json` (default), `text` or `xml` |
+
+The place does not have to be saved in any view. The city is looked up with
+the same geocoder the UI uses and the most relevant match inside the given
+country wins. Temperature, wind and clock units follow your **Units** settings.
+
+Retrieve the data for Kraków as JSON:
+
+```bash
+curl -G 'http://127.0.0.1:5000/api/location' \
+     --data-urlencode 'city=Krakow' \
+     --data-urlencode 'country=Poland'
+```
+
+The same as plain text or XML:
+
+```bash
+curl 'http://127.0.0.1:5000/api/location?city=Reykjavik&country=IS&format=text'
+curl 'http://127.0.0.1:5000/api/location?city=New%20York&country=US&format=xml'
+```
+
+A successful JSON response looks like this (trimmed):
+
+```json
+{
+  "ok": true,
+  "location": {
+    "name": "Krakow",
+    "label": "Krakow, Lesser Poland, Poland",
+    "country": "Poland",
+    "latitude": 50.06143,
+    "longitude": 19.93658,
+    "timezone": "Europe/Warsaw",
+    "units": {"temperature": "°C", "wind_speed": "km/h"},
+    "weather": {"temperature": 4, "condition": {"label": "Light drizzle", "icon": "drizzle"}, "...": "..."},
+    "today": {"sunrise": "06:46", "sunset": "16:01", "day_length": "9h 14m", "forecast": ["..."], "...": "..."},
+    "eclipse": {"type_label": "Partial solar eclipse", "date": "2027-08-02", "obscuration_percent": 37.8, "...": "..."},
+    "errors": {}
+  },
+  "generated_at": "2026-11-11T10:05:54+00:00"
+}
+```
+
+If the weather service is unreachable the eclipse data is still returned and
+the problem is reported under `errors`. Other failures use the usual status
+codes with `{"ok": false, "error": "..."}` (rendered in the requested format):
+`400` for a missing parameter or unknown format, `404` when no such city exists
+in that country, `502` when the geocoder is down.
+
+**Rate limit:** one request per second per client IP. Extra requests are not
+rejected — the server holds each one until its turn comes, so a burst of calls
+is answered one per second, in order. Only a client that queues up more than
+30 seconds' worth of calls gets `429 Too Many Requests` with a `Retry-After`
+header.
+
 ## How the data is produced
 
 Weather, and today's sunrise and sunset, come from
@@ -111,7 +181,7 @@ python -m pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest -q
 ```
 
-91 tests, no network required — the weather provider is stubbed. The astronomy
+107 tests, no network required — the weather provider is stubbed. The astronomy
 tests assert against real published eclipse circumstances, so they are the ones
 that would catch a regression in the maths. The provider tests swap out
 `providers.requests` wholesale, so no HTTP call is ever made.
@@ -146,6 +216,8 @@ services.py            assembles weather + sun + eclipse per location
 providers.py           Open-Meteo / geocoding clients, with caching
 astro.py               sun, moon, sunrise/sunset, eclipse geometry
 settings.py            settings.json persistence (atomic writes)
+formats.py             plain-text and XML rendering for the location API
+ratelimit.py           per-client rate limiter for the location API
 templates/, static/    server-rendered shell, one CSS file, three JS files
 ```
 

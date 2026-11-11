@@ -4,7 +4,7 @@ testpaths = ["test_app.py"]
 [tool.coverage.run]
 # Explicit module list so coverage measures the application only, not the
 # test file or anything living in .venv.
-source = ["app", "astro", "providers", "services", "settings"]
+source = ["app", "astro", "formats", "providers", "ratelimit", "services", "settings"]
 branch = true
 
 [tool.coverage.report]
