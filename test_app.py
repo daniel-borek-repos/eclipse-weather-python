@@ -686,6 +686,12 @@ class TestRoutes(SettingsTestCase):
             self.client.get("/api/views/%s/weather" % view_id).status_code, 200
         )
 
+    def test_no_items_inventory_endpoint(self):
+        self.seed()
+        response = self.client.get("/items?warehouse=main")
+        self.assertEqual(response.status_code, 404)
+        self.assertNotIn("total_value", response.get_data(as_text=True))
+
 
 # --------------------------------------------------------------------------
 # Providers (the HTTP layer)
