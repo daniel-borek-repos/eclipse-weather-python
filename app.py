@@ -37,7 +37,7 @@ app.config["JSON_SORT_KEYS"] = False
 app.config["WTF_CSRF_TIME_LIMIT"] = None
 csrf = CSRFProtect(app)
 # One public location lookup per second per client; extra calls are delayed.
-location_api_limiter = ratelimit.SlotRateLimiter(interval=1.0)
+location_api_limiter = ratelimit.SlotRateLimiter(interval=1.0, max_wait=3.0)
 
 
 # --------------------------------------------------------------------------

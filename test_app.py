@@ -1081,6 +1081,23 @@ def test_rate_limiter_tracks_clients_separately():
     assert limiter.wait("b") == 0
 
 
+def test_rate_limiter_defaults_to_at_most_three_queued_waiters():
+    # With a frozen clock, the first call proceeds and only three more can wait.
+    sleeps = []
+    limiter = ratelimit.SlotRateLimiter(
+        clock=lambda: 0.0, sleep=sleeps.append
+    )
+    for _ in range(4):
+        limiter.wait("a")
+    assert sleeps == [1.0, 2.0, 3.0]
+    try:
+        limiter.wait("a")
+    except ratelimit.RateLimitExceeded as error:
+        assert error.retry_after == 4.0
+    else:
+        raise AssertionError("expected RateLimitExceeded")
+
+
 def test_rate_limiter_refuses_when_queue_is_too_long():
     # A frozen clock lets the reservations pile up without anyone sleeping.
     limiter = ratelimit.SlotRateLimiter(

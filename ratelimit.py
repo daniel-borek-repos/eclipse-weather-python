@@ -22,7 +22,7 @@ class RateLimitExceeded(Exception):
 
 
 class SlotRateLimiter(object):
-    def __init__(self, interval=1.0, max_wait=30.0, clock=time.monotonic,
+    def __init__(self, interval=1.0, max_wait=3.0, clock=time.monotonic,
                  sleep=time.sleep):
         self.interval = interval
         self.max_wait = max_wait
