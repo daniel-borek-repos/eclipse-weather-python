@@ -13,6 +13,7 @@ import datetime as dt
 
 from flask import (
     Flask,
+    Response,
     abort,
     jsonify,
     redirect,
@@ -22,7 +23,9 @@ from flask import (
 )
 from flask_wtf.csrf import CSRFError, CSRFProtect
 
+import formats
 import providers
+import ratelimit
 import services
 import settings as settings_store
 
@@ -33,6 +36,8 @@ app.config["JSON_SORT_KEYS"] = False
 # hour would turn an idle tab into a confusing failure on the next edit.
 app.config["WTF_CSRF_TIME_LIMIT"] = None
 csrf = CSRFProtect(app)
+# One public location lookup per second per client; extra calls are delayed.
+location_api_limiter = ratelimit.SlotRateLimiter(interval=1.0)
 
 
 # --------------------------------------------------------------------------
@@ -233,6 +238,96 @@ def api_detect_location():
     except providers.ProviderError as error:
         return _error(str(error), 502)
     return jsonify({"ok": True, "place": place})
+
+
+# --------------------------------------------------------------------------
+# Public location API
+# --------------------------------------------------------------------------
+
+
+def _formatted(payload, output_format, status=200):
+    if output_format == "text":
+        body = formats.to_text(payload)
+    elif output_format == "xml":
+        body = formats.to_xml(payload)
+    else:
+        response = jsonify(payload)
+        response.status_code = status
+        return response
+    return Response(body, status=status, content_type=formats.MIME_TYPES[output_format])
+
+
+def _match_place(city, country):
+    """The best geocoder hit for ``city`` that lies in ``country``.
+
+    ``country`` matches either the full name or the ISO code, ignoring case.
+    The geocoder already orders results by relevance, so the first hit wins.
+    """
+    wanted = country.casefold()
+    for place in providers.search_places(city, limit=20):
+        names = (place.get("country") or "", place.get("country_code") or "")
+        if wanted in (name.casefold() for name in names):
+            return place
+    return None
+
+
+@app.route("/api/location", methods=["GET"])
+def api_location():
+    """Everything the dashboard shows for one place, looked up by name.
+
+    Unauthenticated and read-only, so it is safe to call with curl. Calls are
+    limited to one per second per client; faster callers are made to wait.
+    """
+    output_format = (request.args.get("format") or "json").strip().lower()
+    if output_format not in formats.SUPPORTED_FORMATS:
+        return _formatted(
+            {"ok": False, "error": "Unsupported format; use one of: %s."
+             % ", ".join(formats.SUPPORTED_FORMATS)},
+            "json",
+            400,
+        )
+
+    try:
+        location_api_limiter.wait(request.remote_addr or "unknown")
+    except ratelimit.RateLimitExceeded as error:
+        response = _formatted({"ok": False, "error": str(error)}, output_format, 429)
+        response.headers["Retry-After"] = str(int(error.retry_after) + 1)
+        return response
+
+    city = (request.args.get("city") or "").strip()
+    country = (request.args.get("country") or "").strip()
+    if not city or not country:
+        return _formatted(
+            {"ok": False, "error": "Provide both 'city' and 'country' parameters."},
+            output_format,
+            400,
+        )
+
+    try:
+        place = _match_place(city, country)
+    except providers.ProviderError as error:
+        return _formatted({"ok": False, "error": str(error)}, output_format, 502)
+    if place is None:
+        return _formatted(
+            {"ok": False, "error": "No place called '%s' found in '%s'." % (city, country)},
+            output_format,
+            404,
+        )
+
+    preferences = settings_store.load()["preferences"]
+    location = services.build_location_payload(place, preferences)
+    # The id identifies a card in a saved view; an ad-hoc lookup has none.
+    location.pop("id", None)
+    return _formatted(
+        {
+            "ok": True,
+            "location": location,
+            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(
+                timespec="seconds"
+            ),
+        },
+        output_format,
+    )
 
 
 # --------------------------------------------------------------------------
