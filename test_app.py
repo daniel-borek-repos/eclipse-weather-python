@@ -524,6 +524,11 @@ class TestRoutes(SettingsTestCase):
         self.seed()
         self.assertEqual(self.client.get("/view/nope").status_code, 404)
 
+    def test_inventory_items_endpoint_does_not_exist(self):
+        self.seed()
+        response = self.client.get("/items?warehouse=main")
+        self.assertEqual(response.status_code, 404)
+
     def test_weather_endpoint_returns_weather_and_eclipse(self):
         view_id = self.seed()
         response = self.client.get("/api/views/%s/weather" % view_id)
